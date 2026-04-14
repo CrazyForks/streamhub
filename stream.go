@@ -3,6 +3,7 @@ package streamhub
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,12 +62,38 @@ func (s *LiveStream) Publish(chunk string) {
 	)
 }
 
+// SubscribeOption configures Subscribe behaviour.
+type SubscribeOption func(*subscribeConfig)
+
+type subscribeConfig struct {
+	bufExtra    int
+	batchReplay bool
+}
+
+// WithBatchReplay makes Subscribe concatenate all existing chunks into
+// a single string instead of sending them one by one. Useful for
+// reconnecting clients that don't need per-chunk granularity on replay.
+func WithBatchReplay() SubscribeOption {
+	return func(c *subscribeConfig) { c.batchReplay = true }
+}
+
+// WithBuffer sets the extra channel buffer size for live chunks.
+// Defaults to 256 if not specified or ≤ 0.
+func WithBuffer(n int) SubscribeOption {
+	return func(c *subscribeConfig) { c.bufExtra = n }
+}
+
 // Subscribe replays existing chunks, then follows new ones.
 // The returned unsubscribe should be called when the caller is done.
-func (s *LiveStream) Subscribe(bufExtra int) (<-chan string, func()) {
-	if bufExtra <= 0 {
-		bufExtra = 256
+func (s *LiveStream) Subscribe(opts ...SubscribeOption) (<-chan string, func()) {
+	cfg := subscribeConfig{bufExtra: 256}
+	for _, o := range opts {
+		o(&cfg)
 	}
+	if cfg.bufExtra <= 0 {
+		cfg.bufExtra = 256
+	}
+
 	ctx := context.Background()
 	key := chunksKey(s.sessionID)
 
@@ -75,13 +102,28 @@ func (s *LiveStream) Subscribe(bufExtra int) (<-chan string, func()) {
 		s.client.B().Xrange().Key(key).Start("-").End("+").Build(),
 	).AsXRange()
 
-	ch := make(chan string, len(entries)+bufExtra)
 	lastID := "0-0"
-	for _, e := range entries {
-		if d, ok := e.FieldValues["d"]; ok {
-			ch <- d
+	var ch chan string
+	if len(entries) > 0 && cfg.batchReplay {
+		ch = make(chan string, 1+cfg.bufExtra)
+		var replay strings.Builder
+		for _, e := range entries {
+			if d, ok := e.FieldValues["d"]; ok {
+				replay.WriteString(d)
+			}
+			lastID = e.ID
 		}
-		lastID = e.ID
+		if replay.Len() > 0 {
+			ch <- replay.String()
+		}
+	} else {
+		ch = make(chan string, len(entries)+cfg.bufExtra)
+		for _, e := range entries {
+			if d, ok := e.FieldValues["d"]; ok {
+				ch <- d
+			}
+			lastID = e.ID
+		}
 	}
 
 	// The stream may have finished between XRANGE and Done.
