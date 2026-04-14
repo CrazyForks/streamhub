@@ -11,21 +11,18 @@ import (
 )
 
 const (
-	// xreadBlock is the XREAD BLOCK timeout. Keep it short so that
-	// xreadLoop can detect stream completion promptly.
+	// Keep this short so shutdown can be observed quickly.
 	xreadBlock = 500 * time.Millisecond
-	// keyTTL is how long Redis keys are kept after Close for late
-	// xreadLoop iterations on other instances to detect "done".
+	// Keep keys around a bit after Close so other subscribers can finish.
 	keyTTL = 60 * time.Second
 )
 
-// LiveStream is a Redis-backed session stream proxy.
-// Producer-side instances carry a generation used for fencing;
-// subscriber-only proxies (from Get) have an empty generation.
+// LiveStream is a Redis-backed stream for one session.
+// generation is only set on the producer side.
 type LiveStream struct {
 	client     rueidis.Client
 	sessionID  string
-	generation string // fencing token; empty for subscriber-only proxies
+	generation string // empty on subscriber-only proxies
 	hub        *Hub
 
 	mu     sync.Mutex
@@ -33,12 +30,12 @@ type LiveStream struct {
 	nextID uint64
 
 	closeOnce sync.Once
-	closeCh   chan struct{} // closed by Close() to signal local xreadLoops
+	closeCh   chan struct{} // closed by Close to stop local xreadLoops
 }
 
 type subscriber struct {
 	ch     chan string
-	cancel context.CancelFunc // cancels the xreadLoop goroutine
+	cancel context.CancelFunc
 }
 
 func newLiveStream(hub *Hub, sessionID, generation string) *LiveStream {
@@ -52,14 +49,10 @@ func newLiveStream(hub *Hub, sessionID, generation string) *LiveStream {
 	}
 }
 
-// activeTTL is the lease duration for active streams. The producer
-// refreshes it via heartbeat + Publish. If the producer crashes, the
-// keys expire and new requests can register fresh.
+// activeTTL is the lease for an active stream.
 const activeTTL = 600 // seconds (10 min)
 
-// Publish appends a chunk to the Redis Stream. Uses a Lua script to
-// check the generation fencing token before writing, so a stale
-// producer that lost its lease cannot pollute a newer generation's stream.
+// Publish appends a chunk to Redis if the generation still matches.
 func (s *LiveStream) Publish(chunk string) {
 	ctx := context.Background()
 	publishScript.Exec(ctx, s.client,
@@ -68,12 +61,8 @@ func (s *LiveStream) Publish(chunk string) {
 	)
 }
 
-// Subscribe returns a channel that replays all existing chunks from Redis,
-// then delivers live chunks via XREAD BLOCK. The caller must call the
-// returned unsubscribe function when done (e.g. HTTP disconnect).
-//
-// If the stream is already complete, the channel is pre-filled with all
-// chunks and immediately closed.
+// Subscribe replays existing chunks, then follows new ones.
+// The returned unsubscribe should be called when the caller is done.
 func (s *LiveStream) Subscribe(bufExtra int) (<-chan string, func()) {
 	if bufExtra <= 0 {
 		bufExtra = 256
@@ -81,7 +70,7 @@ func (s *LiveStream) Subscribe(bufExtra int) (<-chan string, func()) {
 	ctx := context.Background()
 	key := chunksKey(s.sessionID)
 
-	// Replay existing chunks.
+	// Replay what is already in Redis.
 	entries, _ := s.client.Do(ctx,
 		s.client.B().Xrange().Key(key).Start("-").End("+").Build(),
 	).AsXRange()
@@ -95,15 +84,14 @@ func (s *LiveStream) Subscribe(bufExtra int) (<-chan string, func()) {
 		lastID = e.ID
 	}
 
-	// Already done — drain any chunks published after the initial XRANGE
-	// but before we checked Done, then close.
+	// The stream may have finished between XRANGE and Done.
 	if s.Done() {
 		s.drainRemaining(key, lastID, ch)
 		close(ch)
 		return ch, func() {}
 	}
 
-	// Start xreadLoop for live delivery.
+	// Switch to live delivery.
 	subCtx, subCancel := context.WithCancel(context.Background())
 	id := s.addSubscriber(ch, subCancel)
 	go s.xreadLoop(subCtx, key, lastID, ch)
@@ -129,13 +117,11 @@ func (s *LiveStream) removeSubscriber(id uint64) {
 	delete(s.subs, id)
 }
 
-// xreadLoop polls Redis for new chunks and writes them to ch.
-// It exits (and closes ch) when ctx is cancelled or the stream is done.
+// xreadLoop keeps reading new chunks until the stream ends or stops locally.
 func (s *LiveStream) xreadLoop(ctx context.Context, key, cursor string, ch chan string) {
 	defer close(ch)
 
 	for {
-		// Check for cancellation or local close signal.
 		select {
 		case <-ctx.Done():
 			s.drainRemaining(key, cursor, ch)
@@ -162,14 +148,14 @@ func (s *LiveStream) xreadLoop(ctx context.Context, key, cursor string, ch chan 
 				return
 			}
 			if rueidis.IsRedisNil(err) {
-				// XREAD timeout — check if stream ended.
+				// XREAD timed out, so check whether the stream ended.
 				if s.Done() {
 					s.drainRemaining(key, cursor, ch)
 					return
 				}
 				continue
 			}
-			// Transient error.
+			// Retry on transient errors.
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
@@ -185,10 +171,8 @@ func (s *LiveStream) xreadLoop(ctx context.Context, key, cursor string, ch chan 
 	}
 }
 
-// drainRemaining reads any chunks after cursor that haven't been
-// delivered yet and writes them to ch before the channel is closed.
-// Uses non-blocking sends — if the buffer is full (consumer gone),
-// chunks are silently dropped.
+// drainRemaining flushes chunks after cursor before closing ch.
+// If the consumer is already gone, extra chunks are dropped.
 func (s *LiveStream) drainRemaining(key, cursor string, ch chan string) {
 	entries, err := s.client.Do(context.Background(),
 		s.client.B().Xrange().Key(key).Start("("+cursor).End("+").Build(),
@@ -206,16 +190,15 @@ func (s *LiveStream) drainRemaining(key, cursor string, ch chan string) {
 	}
 }
 
-// SetMetadata stores caller-defined data in Redis as JSON.
-// Must be called before Close. Fenced by generation — a stale producer
-// cannot overwrite a newer generation's metadata.
+// SetMetadata stores stream metadata as JSON.
+// It only writes when the current generation still owns the stream.
 func (s *LiveStream) SetMetadata(v any) {
 	if s.generation == "" {
 		return
 	}
 	ctx := context.Background()
 	mk := metaKey(s.sessionID)
-	// Check generation before writing.
+	// Do not let an old generation overwrite metadata.
 	gen, _ := s.client.Do(ctx, s.client.B().Hget().Key(mk).Field("gen").Build()).ToString()
 	if gen != s.generation {
 		return
@@ -229,8 +212,7 @@ func (s *LiveStream) SetMetadata(v any) {
 	)
 }
 
-// Metadata reads the stored metadata from Redis and unmarshals it into
-// the target pointer. Returns true on success.
+// Metadata loads stored metadata into target.
 func (s *LiveStream) Metadata(target any) bool {
 	raw, err := s.client.Do(context.Background(),
 		s.client.B().Hget().Key(metaKey(s.sessionID)).Field("metadata").Build(),
@@ -241,38 +223,34 @@ func (s *LiveStream) Metadata(target any) bool {
 	return json.UnmarshalString(raw, target) == nil
 }
 
-// Close marks the stream as done, signals all local xreadLoop goroutines
-// to exit, and sets a TTL on the Redis keys for auto-cleanup.
-// If this LiveStream's generation is stale (no longer matches Redis),
-// Close is a local-only no-op — it won't touch Redis or the new
-// generation's infrastructure.
+// Close marks the stream as done and stops local subscribers.
+// If this generation is stale, Close only shuts down local state.
 func (s *LiveStream) Close() {
 	s.closeOnce.Do(func() {
 		ctx := context.Background()
 		mk := metaKey(s.sessionID)
 		ck := chunksKey(s.sessionID)
 
-		// Fencing: only write to Redis if we're still the current owner.
+		// Only the current owner can close the Redis-side stream.
 		if s.generation != "" {
 			gen, _ := s.client.Do(ctx,
 				s.client.B().Hget().Key(mk).Field("gen").Build(),
 			).ToString()
 			if gen != s.generation {
-				// Stale producer — don't touch Redis or the new generation's locals.
+				// A stale producer should only stop its own local work.
 				close(s.closeCh)
 				return
 			}
 		}
 
-		// Mark done in Redis.
+		// Mark the stream as done.
 		s.client.Do(ctx, s.client.B().Hset().Key(mk).
 			FieldValue().FieldValue("status", "done").Build())
-		// TTL for auto-cleanup — gives remote xreadLoops time to see "done".
+		// Keep keys briefly so remote readers can observe the done state.
 		s.client.Do(ctx, s.client.B().Expire().Key(mk).Seconds(int64(keyTTL.Seconds())).Build())
 		s.client.Do(ctx, s.client.B().Expire().Key(ck).Seconds(int64(keyTTL.Seconds())).Build())
 
-		// Cancel all local xreadLoop contexts to interrupt XREAD BLOCK
-		// immediately, then signal via closeCh as a fallback.
+		// Stop local readers first, then close closeCh as a fallback.
 		s.mu.Lock()
 		for _, sub := range s.subs {
 			sub.cancel()
@@ -280,13 +258,12 @@ func (s *LiveStream) Close() {
 		s.mu.Unlock()
 		close(s.closeCh)
 
-		// Clean up local cancel listener + heartbeat (fenced).
+		// Clean up local producer state.
 		s.hub.cleanupLocal(s.sessionID, s.generation)
 	})
 }
 
-// Cancel broadcasts a cancel signal via Redis Pub/Sub and writes a
-// durable flag to the Hash as a fallback for the Pub/Sub startup race.
+// Cancel broadcasts cancel and also writes a durable cancel flag.
 func (s *LiveStream) Cancel() {
 	ctx := context.Background()
 	mk := metaKey(s.sessionID)
@@ -296,7 +273,7 @@ func (s *LiveStream) Cancel() {
 	)
 }
 
-// Done reports whether the stream is marked as completed in Redis.
+// Done reports whether the stream is marked done in Redis.
 func (s *LiveStream) Done() bool {
 	status, err := s.client.Do(context.Background(),
 		s.client.B().Hget().Key(metaKey(s.sessionID)).Field("status").Build(),

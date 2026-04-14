@@ -10,11 +10,10 @@ import (
 	prov "github.com/bytedance/sonic"
 )
 
-// RawMessage re-exports encoding/json.RawMessage so callers don't need to import encoding/json directly.
+// RawMessage re-exports encoding/json.RawMessage.
 type RawMessage = json.RawMessage
 
-// RepairAndUnmarshal 对 LLM 返回的结构化 JSON 做 repair + 反序列化。
-// 统一收拢 Service/Runtime 层中 jsonrepair.Repair → json.Unmarshal 的重复模式。
+// RepairAndUnmarshal 先修复 JSON，再反序列化。
 func RepairAndUnmarshal[T any](raw string, out *T) error {
 	repaired, err := jsonrepair.Repair(raw)
 	if err != nil {

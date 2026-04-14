@@ -1,14 +1,6 @@
-// Package streamhub provides a Redis-backed stream broker that decouples
-// producer lifetime from consumer (HTTP connection) lifetime.
-//
-// Chunks are stored in Redis Streams so that any instance can replay and
-// subscribe. Cancel signals are broadcast via Redis Pub/Sub so that the
-// instance holding the runtime receives the stop request regardless of
-// which instance the cancel HTTP request lands on.
-//
-// Each registration carries a unique generation ID used as a fencing
-// token: stale producers that lost their lease cannot pollute a newer
-// generation's stream or tear down its infrastructure.
+// Package streamhub keeps session streams in Redis so producers,
+// subscribers, and cancels can land on different instances.
+// Generation IDs are used as fencing tokens to keep stale producers out.
 package streamhub
 
 import (
@@ -35,8 +27,8 @@ end
 return 0
 `)
 
-// publishScript atomically checks generation before writing a chunk.
-// Returns 1 if the chunk was written, 0 if the generation is stale.
+// publishScript checks generation before writing a chunk.
+// It returns 1 when the write succeeds, 0 when the generation is stale.
 // KEYS[1] = meta key, KEYS[2] = chunks key
 // ARGV[1] = generation, ARGV[2] = chunk data, ARGV[3] = TTL seconds
 var publishScript = rueidis.NewLuaScript(`
@@ -47,7 +39,7 @@ redis.call("EXPIRE", KEYS[2], tonumber(ARGV[3]))
 return 1
 `)
 
-// Hub manages [LiveStream]s backed by Redis.
+// Hub manages Redis-backed [LiveStream] values.
 type Hub struct {
 	client rueidis.Client
 
@@ -55,14 +47,13 @@ type Hub struct {
 	locals map[string]*localState
 }
 
-// localState holds per-session data that only makes sense on the
-// instance that owns the producer goroutine.
+// localState keeps local-only state for the current producer.
 type localState struct {
 	generation string
-	cancelSub  context.CancelFunc // stops heartbeat + Pub/Sub listener
+	cancelSub  context.CancelFunc // stops heartbeat and Pub/Sub listener
 }
 
-// New creates a Hub backed by the given Redis client.
+// New creates a Hub from a Redis client.
 func New(client rueidis.Client) *Hub {
 	return &Hub{
 		client: client,
@@ -70,11 +61,8 @@ func New(client rueidis.Client) *Hub {
 	}
 }
 
-// Register atomically creates a new [LiveStream] for the given session.
-// It returns the stream and true if a new one was created, or a proxy
-// to the existing in-progress stream and false.
-// The caller MUST NOT start a producer when created == false.
-// Returns a non-nil error only when Redis is unavailable.
+// Register tries to create a new [LiveStream] for sessionID.
+// If created is false, the caller must not start another producer.
 func (h *Hub) Register(sessionID string, cancelRuntime func()) (*LiveStream, bool, error) {
 	ctx := context.Background()
 	mk := metaKey(sessionID)
@@ -93,14 +81,14 @@ func (h *Hub) Register(sessionID string, cancelRuntime func()) (*LiveStream, boo
 
 	subCtx, cancelSub := context.WithCancel(context.Background())
 
-	// Background heartbeat: refresh TTL + poll durable cancel flag.
+	// Keep the lease alive and watch for cancel.
 	go h.heartbeat(subCtx, sessionID, gen, cancelRuntime)
-	// Pub/Sub listener for instant cancel delivery.
+	// Deliver cancel as soon as Pub/Sub sees it.
 	go h.listenCancel(subCtx, sessionID, cancelRuntime)
 
 	h.mu.Lock()
 	if old, ok := h.locals[sessionID]; ok {
-		old.cancelSub() // stop stale generation's heartbeat + Pub/Sub listener
+		old.cancelSub() // stop the old generation's local loops
 	}
 	h.locals[sessionID] = &localState{
 		generation: gen,
@@ -111,8 +99,7 @@ func (h *Hub) Register(sessionID string, cancelRuntime func()) (*LiveStream, boo
 	return newLiveStream(h, sessionID, gen), true, nil
 }
 
-// Get returns a stream proxy for sessionID, or nil if no stream exists
-// in Redis.
+// Get returns a stream proxy for sessionID, or nil if it does not exist.
 func (h *Hub) Get(sessionID string) *LiveStream {
 	ctx := context.Background()
 	status, err := h.client.Do(ctx,
@@ -124,8 +111,7 @@ func (h *Hub) Get(sessionID string) *LiveStream {
 	return newLiveStream(h, sessionID, "")
 }
 
-// Active returns the set of session IDs that currently have a
-// non-completed stream.
+// Active reports which session IDs still have an unfinished stream.
 func (h *Hub) Active(sessionIDs []string) map[string]bool {
 	if len(sessionIDs) == 0 {
 		return nil
@@ -146,24 +132,22 @@ func (h *Hub) Active(sessionIDs []string) map[string]bool {
 	return out
 }
 
-// Remove immediately evicts a stream's Redis keys and local state.
+// Remove deletes a stream's Redis keys and local state.
 func (h *Hub) Remove(sessionID string) {
 	ctx := context.Background()
 	h.client.Do(ctx, h.client.B().Del().Key(chunksKey(sessionID), metaKey(sessionID)).Build())
 	h.cleanupLocal(sessionID, "")
 }
 
-// cleanupLocal removes local cancel state and stops the heartbeat +
-// Pub/Sub listener. If generation is non-empty, only cleans up if it
-// matches (fencing). Empty generation means unconditional cleanup
-// (used by Remove for error paths).
+// cleanupLocal clears local state and stops the local background loops.
+// If generation is set, it must match the current owner.
 func (h *Hub) cleanupLocal(sessionID, generation string) {
 	h.mu.Lock()
 	ls, ok := h.locals[sessionID]
 	if ok && (generation == "" || ls.generation == generation) {
 		delete(h.locals, sessionID)
 	} else {
-		ok = false // don't cancel a different generation's listener
+		ok = false // do not stop another generation's listener
 	}
 	h.mu.Unlock()
 
@@ -172,9 +156,7 @@ func (h *Hub) cleanupLocal(sessionID, generation string) {
 	}
 }
 
-// heartbeat periodically refreshes the TTL on session keys and polls
-// the durable cancel flag. Runs every 2 seconds. Stops immediately if
-// the generation in Redis no longer matches (stale producer).
+// heartbeat refreshes TTL and checks the durable cancel flag.
 func (h *Hub) heartbeat(ctx context.Context, sessionID, generation string, cancelRuntime func()) {
 	mk := metaKey(sessionID)
 	ck := chunksKey(sessionID)
@@ -185,7 +167,7 @@ func (h *Hub) heartbeat(ctx context.Context, sessionID, generation string, cance
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Fencing: stop if we're no longer the current owner.
+			// Stop if we are no longer the current owner.
 			gen, _ := h.client.Do(ctx, h.client.B().Hget().Key(mk).Field("gen").Build()).ToString()
 			if gen != generation {
 				return
@@ -202,16 +184,13 @@ func (h *Hub) heartbeat(ctx context.Context, sessionID, generation string, cance
 	}
 }
 
-// listenCancel subscribes to the cancel Pub/Sub channel for a session
-// and invokes cancelRuntime when a message arrives.
+// listenCancel listens on the session cancel channel.
 func (h *Hub) listenCancel(ctx context.Context, sessionID string, cancelRuntime func()) {
 	_ = h.client.Receive(ctx,
 		h.client.B().Subscribe().Channel(cancelChannel(sessionID)).Build(),
 		func(msg rueidis.PubSubMessage) { cancelRuntime() },
 	)
 }
-
-// --- helpers ---
 
 const keyPrefix = "streamhub:"
 
