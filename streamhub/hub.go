@@ -17,8 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gtoxlili/streamhub/pkg/identity/uuidutil"
 	"github.com/redis/rueidis"
-	"github.com/yomomo-ai/agent-core/pkg/identity/uuidutil"
 )
 
 // KEYS[1] = meta key, KEYS[2] = chunks key
@@ -218,4 +218,3 @@ const keyPrefix = "streamhub:"
 func chunksKey(sessionID string) string     { return keyPrefix + sessionID + ":chunks" }
 func metaKey(sessionID string) string       { return keyPrefix + sessionID + ":meta" }
 func cancelChannel(sessionID string) string { return keyPrefix + sessionID + ":cancel" }
-

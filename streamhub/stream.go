@@ -2,11 +2,11 @@ package streamhub
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/gtoxlili/streamhub/pkg/json"
 	"github.com/redis/rueidis"
 )
 
@@ -238,7 +238,7 @@ func (s *LiveStream) Metadata(target any) bool {
 	if err != nil || raw == "" {
 		return false
 	}
-	return json.Unmarshal([]byte(raw), target) == nil
+	return json.UnmarshalString(raw, target) == nil
 }
 
 // Close marks the stream as done, signals all local xreadLoop goroutines
