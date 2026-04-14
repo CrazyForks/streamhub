@@ -263,14 +263,28 @@ func (s *LiveStream) Close() {
 	})
 }
 
-// Cancel broadcasts cancel and also writes a durable cancel flag.
-func (s *LiveStream) Cancel() {
-	ctx := context.Background()
+// Cancel broadcasts a cancel signal and waits for the stream to finish
+// (or the context to expire). Pass context.Background() for fire-and-forget.
+func (s *LiveStream) Cancel(ctx context.Context) {
 	mk := metaKey(s.sessionID)
-	s.client.DoMulti(ctx,
+	s.client.DoMulti(context.Background(),
 		s.client.B().Hset().Key(mk).FieldValue().FieldValue("cancel", "1").Build(),
 		s.client.B().Publish().Channel(cancelChannel(s.sessionID)).Message("cancel").Build(),
 	)
+
+	// Wait for the producer to finish (Close sets status=done).
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s.Done() {
+				return
+			}
+		}
+	}
 }
 
 // Done reports whether the stream is marked done in Redis.
